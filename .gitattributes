@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# The upstream patch keeps its original line endings (some target CRLF files).
+*.patch -text

@@ -1,0 +1,616 @@
+diff --git a/ports/th20/portable/sdl/Renderer.cpp b/ports/th20/portable/sdl/Renderer.cpp
+index e361d5a..7d49d9b 100644
+--- a/ports/th20/portable/sdl/Renderer.cpp
++++ b/ports/th20/portable/sdl/Renderer.cpp
+@@ -1,3 +1,4 @@
++#include "th20n_native.h"
+ #include "Renderer.hpp"
+ #include "Shaders.hpp"
+ #include "ResampleShader.hpp"
+@@ -203,6 +204,11 @@ Renderer::GPU& Renderer::surface(u32 h){
+   stats.uploadBytes+=s.size;bind_texture(g.texture);glPixelStorei(GL_UNPACK_ALIGNMENT,1);GLenum format=GL_RGBA,type=GL_UNSIGNED_BYTE,internal=GL_RGBA8;
+   bool rgb=s.format==PixelFormat::Bgr8||s.format==PixelFormat::Bgrx8||s.format==PixelFormat::Rgb565;u32 channels=rgb?3:4;pixels.resize(s.width*s.height*(s.format==PixelFormat::Argb4444?2:channels));
+   if(s.format==PixelFormat::Argb4444){for(u32 y=0;y<s.height;y++)for(u32 x=0;x<s.width;x++){uint16_t n;std::memcpy(&n,s.data+y*s.pitch+x*2,2);n=(n<<4)|(n>>12);std::memcpy(pixels.data()+(y*s.width+x)*2,&n,2);}type=GL_UNSIGNED_SHORT_4_4_4_4;internal=GL_RGBA4;}
++  else if(s.format==PixelFormat::Bgra8){
++   // Native build: the host converts (one pass, no per-pixel format checks).
++   th20n_bgra_to_rgba(s.data,s.pitch,s.width,s.height,0,pixels.data());
++   format=GL_RGBA;internal=GL_RGBA8;
++  }
+   else {for(u32 y=0;y<s.height;y++)for(u32 x=0;x<s.width;x++){
+     const u8* p=s.data+y*s.pitch;u32 r=0,gc=0,b=0,a=255;
+     if(s.format==PixelFormat::Bgra8||s.format==PixelFormat::Bgrx8){p+=x*4;b=p[0];gc=p[1];r=p[2];a=s.format==PixelFormat::Bgra8?p[3]:255;}
+diff --git a/ports/th20/portable/sdl/ResampleShader.hpp b/ports/th20/portable/sdl/ResampleShader.hpp
+index c6116b1..33748da 100644
+--- a/ports/th20/portable/sdl/ResampleShader.hpp
++++ b/ports/th20/portable/sdl/ResampleShader.hpp
+@@ -76,8 +76,8 @@ void main(){
+   }
+  }else{value=originalPixel(sourceRect.xy+at*sourceRect.zw/destinationRect.zw);}
+  uvec4 mask=uvec4(destinationMask);
+- uvec4 packed=uvec4(channel(value.r,mask.r),channel(value.g,mask.g),channel(value.b,mask.b),channel(value.a,mask.a));
+- outputColor=mix(vec4(1),vec4(packed)/max(vec4(mask),vec4(1)),greaterThan(mask,uvec4(0)));
++ uvec4 packedValue=uvec4(channel(value.r,mask.r),channel(value.g,mask.g),channel(value.b,mask.b),channel(value.a,mask.a));
++ outputColor=mix(vec4(1),vec4(packedValue)/max(vec4(mask),vec4(1)),greaterThan(mask,uvec4(0)));
+ }
+ )GLSL";
+ }
+diff --git a/ports/th20/src/audio_runtime/sound_controller.cpp b/ports/th20/src/audio_runtime/sound_controller.cpp
+index 0424852..3acfebf 100644
+--- a/ports/th20/src/audio_runtime/sound_controller.cpp
++++ b/ports/th20/src/audio_runtime/sound_controller.cpp
+@@ -228,6 +228,12 @@ int SoundInf::shutdown() {
+ }
+ int SoundInf::poll() {
+     std::unique_lock<std::recursive_mutex> initial(runtime::shared_locks().slot(11));
++#ifdef TH_SDL3
++    // No audio device (it failed to open): nothing will ever run these
++    // commands, and the stage loader waits for the queue to empty
++    // (load_gameplay: while audio_commands_pending). Drop them: play silent.
++    if(!device_owner) {for(auto& command:commands) command.type=0;return 0;}
++#endif
+     if(!device_owner) return 0; // original returns zero from its unlocking helper
+     initial.unlock();
+     Command* current=commands;
+diff --git a/ports/th20/src/platform_services/configuration.cpp b/ports/th20/src/platform_services/configuration.cpp
+index 2919946..6e3ad15 100644
+--- a/ports/th20/src/platform_services/configuration.cpp
++++ b/ports/th20/src/platform_services/configuration.cpp
+@@ -5,7 +5,9 @@
+ 
+ namespace th20::source::platform {
+ void initialize_bindings(KeyBindings& value) noexcept {
+-    constexpr KeyBindings defaults{{0,1,2,3,0xffff,0xffff,0xffff,0xffff},
++    // Switch port: pad buttons 0 B, 1 A, 2 L/ZL, 3 R/ZR, 4 + (the layout of
++    // the other Switch ports), so pause defaults to + (the PC default is 3).
++    constexpr KeyBindings defaults{{0,1,2,4,0xffff,0xffff,0xffff,0xffff},
+         {0,1,5,10,0xffff,0xffff,0xffff,0xffff},
+         {0x5a,0x58,0x10,0x1b,0x26,0x28,0x25,0x27}};
+     value = defaults;
+diff --git a/ports/th20/src/player_entity/events.cpp b/ports/th20/src/player_entity/events.cpp
+index df5cd1f..d441609 100644
+--- a/ports/th20/src/player_entity/events.cpp
++++ b/ports/th20/src/player_entity/events.cpp
+@@ -1,4 +1,5 @@
+ #include "events.hpp"
++#include "th20n_native.h"
+ #include <cstring>
+ namespace th20::source::player_entity {
+ namespace {
+@@ -11,6 +12,7 @@ void add_graze_count(game_session::Player& player,int amount) noexcept{
+     if(count<0)count=0;if(count>99999999)count=99999999;put(&player,0xe4,count);
+ }
+ void hit(void* player,EventServices& host){
++    if(th20n_test_flags()&1u)return; // desktop test hook (TH20_TEST_FLAGS=1)
+     auto& context=*get<game_session::Context*>(player,0x14858);
+     host.mark_enemies();host.notify_secondary(context.objects_04[3]);
+     auto* overlay=host.session().contexts[0].overlay_owner;
+diff --git a/ports/th20/src/progress_state/compression.cpp b/ports/th20/src/progress_state/compression.cpp
+index ab678c2..9aca714 100644
+--- a/ports/th20/src/progress_state/compression.cpp
++++ b/ports/th20/src/progress_state/compression.cpp
+@@ -1,6 +1,7 @@
+ #include "compression.hpp"
+ #include <algorithm>
+ #include <stdexcept>
++#include "th20n_native.h"
+ namespace th20::source::progress {
+ void LzssEncoder::promote(std::uint32_t old_node,std::uint32_t new_node) {
+     auto& old=tree_[old_node];auto& next=tree_[new_node];next.parent=old.parent;
+@@ -29,6 +30,9 @@ unsigned LzssEncoder::insert(std::uint32_t index,std::uint32_t& match) {
+     }
+ }
+ Bytes LzssEncoder::encode(std::span<const std::uint8_t> input) {
++    // Native build: the host runs this same encoder (same bytes, same final
++    // dictionary); the search tree is not used after encoding.
++    {Bytes encoded(th20n_lzss_encode(input.data(),static_cast<std::uint32_t>(input.size()),dictionary_.data()));th20n_lzss_take(encoded.data());return encoded;}
+     // 5399a0 resets both work areas. 5399d0 installs node1 under sentinel8192.
+     dictionary_.fill(0);tree_.fill({0,0,0});
+     std::size_t position=std::min<std::size_t>(18,input.size());for(std::size_t i=0;i<position;++i)dictionary_[i+1]=input[i];
+diff --git a/ports/th20/src/sprite_renderer/animation.cpp b/ports/th20/src/sprite_renderer/animation.cpp
+index cd36f41..31aed5d 100644
+--- a/ports/th20/src/sprite_renderer/animation.cpp
++++ b/ports/th20/src/sprite_renderer/animation.cpp
+@@ -8,6 +8,7 @@ void construct_animation_base(AnimationBase& a) noexcept {
+     std::memset(reinterpret_cast<unsigned char*>(&a)+0x444,0,sizeof(a)-0x444);
+ }
+ void construct_animation(Animation& a) noexcept {
++    invalidate_layer_index();
+     construct_animation_base(a.base);
+     a.handle=a.index=0;a.timer_4c8={};a.timer_4d8={};a.field_4e8=0;
+     for(auto& link:a.links)link={&a,nullptr,nullptr,nullptr,nullptr};
+@@ -20,6 +21,7 @@ void construct_pooled_animation(PooledAnimation& a) noexcept {
+     construct_animation(a.animation);a.free_link={};a.active=0;a.index=0;
+ }
+ void reset_animation_state(Animation& a) noexcept {
++    invalidate_layer_index();
+ #ifdef TH_SDL3
+     // Retail 4299d0 only resets selected fields. Reusing a VM can therefore
+     // retain script variables, interpolation timers, callbacks and geometry
+@@ -48,5 +50,5 @@ void reset_animation_state(Animation& a) noexcept {
+     b.interpolation_2a0.duration=b.interpolation_2f4.duration=b.interpolation_320.duration=b.interpolation_34c.duration=0;
+     a.fields_550[8]=0; // +0x570
+ }
+-void clear_animation_suffix(Animation& a) noexcept { a.field_5dc=a.field_5e0=0; }
++void clear_animation_suffix(Animation& a) noexcept { invalidate_layer_index();a.field_5dc=a.field_5e0=0; }
+ }
+diff --git a/ports/th20/src/sprite_renderer/animation.hpp b/ports/th20/src/sprite_renderer/animation.hpp
+index 75520c0..c29093c 100644
+--- a/ports/th20/src/sprite_renderer/animation.hpp
++++ b/ports/th20/src/sprite_renderer/animation.hpp
+@@ -84,4 +84,7 @@ void construct_animation(Animation&) noexcept;              // 0x448b40
+ void construct_pooled_animation(PooledAnimation&) noexcept; // 0x4489f0
+ void reset_animation_state(Animation&) noexcept;             // 0x4299d0
+ void clear_animation_suffix(Animation&) noexcept;            // 0x429e30 -> 0x438a50/0x438a30
++// Native build: the per-layer index of the draw lists (dispatch.cpp) is
++// rebuilt after anything that changes list membership or an animation's layer.
++void invalidate_layer_index() noexcept;
+ }
+diff --git a/ports/th20/src/sprite_renderer/binding.cpp b/ports/th20/src/sprite_renderer/binding.cpp
+index ce4ac33..cb80d6f 100644
+--- a/ports/th20/src/sprite_renderer/binding.cpp
++++ b/ports/th20/src/sprite_renderer/binding.cpp
+@@ -28,6 +28,7 @@ void store_sprite_descriptor(AnimationFile& file,std::int32_t index,const Sprite
+     sprite.extent_48=div(sub(sprite.bottom,sprite.top),input.scale_54);
+ }
+ void copy_animation_base(Animation& destination,const Animation& source) noexcept {
++    invalidate_layer_index();
+     std::memmove(&destination.base,&source.base,sizeof(AnimationBase));
+ }
+ void select_animation_template(AnimationFile& file,Animation& animation,std::int32_t index) {
+@@ -48,6 +49,7 @@ void attach_animation_parent(Animation& animation,Animation* parent) noexcept {
+     }
+ }
+ void set_animation_layer(Animation& animation,std::int32_t layer) noexcept {
++    invalidate_layer_index();
+     animation.base.fields_10_28[1]=static_cast<std::uint32_t>(layer);
+     const auto mode=layer>=3&&layer<=19?1u:layer>=20&&layer<=23?2u:0u;
+     animation.base.flags[2]=(animation.base.flags[2]&~0x03000000u)|(mode<<24);
+diff --git a/ports/th20/src/sprite_renderer/dispatch.cpp b/ports/th20/src/sprite_renderer/dispatch.cpp
+index 0864158..f7d73b2 100644
+--- a/ports/th20/src/sprite_renderer/dispatch.cpp
++++ b/ports/th20/src/sprite_renderer/dispatch.cpp
+@@ -7,16 +7,77 @@
+ #include "sprite.hpp"
+ #include "../../../web/cpp/sdl/HitboxDisplay.hpp"
+ #include "quad.hpp"
++#include "th20n_native.h"
++#include <cstdio>
++#include <vector>
+ extern "C" void sdl_startup_branding_draw(unsigned alpha);
+ #endif
+ namespace th20::source::sprite {
++namespace {
++std::int32_t effective_layer(const Animation& a,bool secondary) noexcept {
++    auto effective=static_cast<std::int32_t>(a.base.fields_10_28[1]);
++    if(secondary){if(effective>=29 && effective<=36)effective+=17;else effective=effective==26?45:47;}
++    else {if(effective>=46 && effective<=53)effective-=17;else if(effective==45)effective=26;}
++    return effective;
++}
++#ifdef TH_SDL3
++// Native build: each of the ~50 layer draws of a frame used to walk every
++// animation of both groups to pick the ones on its layer; with thousands of
++// bullets and bomb particles that walk was a third of the game's CPU time.
++// The groups are now split by layer in one walk and the split is reused
++// until something changes list membership, order or an animation's layer
++// (invalidate_layer_index, called by every such change). The skip flag is
++// read at selection time, as before, so the selection is the same.
++constexpr std::int32_t indexed_layers=64;
++std::uint32_t layer_version=1;
++struct LayerIndex {
++    std::uint32_t version=0;const AnimationList* lists=nullptr;
++    std::vector<Animation*> layers[2][indexed_layers];
++} layer_index;
++void build_layer_index(AnimationList* group) {
++    for(auto& per_group:layer_index.layers)for(auto& layer:per_group)layer.clear();
++    for(int secondary=0;secondary<2;++secondary)
++        for(scheduler::Iterator it(reinterpret_cast<scheduler::Link*>(group[secondary].sentinel.next));it.current;it.advance()){
++            auto* a=reinterpret_cast<Animation*>(it.current->value);
++            const auto effective=effective_layer(*a,secondary!=0);
++            if(effective>=0&&effective<indexed_layers)layer_index.layers[secondary][effective].push_back(a);
++        }
++    layer_index.version=layer_version;layer_index.lists=group;
++}
++std::uint32_t select_indexed_animations(AnimationList* group,std::int32_t layer,bool secondary) {
++    if(layer_index.version!=layer_version||layer_index.lists!=group)build_layer_index(group);
++    initialize_animation_list(group[2]);std::uint32_t selected=0;
++    for(auto* a:layer_index.layers[secondary?1:0][layer]){
++        if(a->fields_550[8])continue;
++        initialize_animation_link(a->links[1],a);scheduler::append(reinterpret_cast<scheduler::List&>(group[2]),reinterpret_cast<scheduler::Link&>(a->links[1]));++selected;
++    }return selected;
++}
++// Desktop test hook (TH20_TEST_FLAGS bit 1): every indexed selection is
++// compared with the full walk; a difference is reported and the walk's
++// selection is used.
++std::uint32_t select_checked_animations(AnimationList* group,std::int32_t layer,bool secondary) {
++    const auto expected_count=select_layer_animations(group,layer,secondary);
++    std::vector<const Animation*> expected;
++    for(scheduler::Iterator it(reinterpret_cast<scheduler::Link*>(group[2].sentinel.next));it.current;it.advance())expected.push_back(reinterpret_cast<const Animation*>(it.current->value));
++    const auto count=select_indexed_animations(group,layer,secondary);
++    std::vector<const Animation*> actual;
++    for(scheduler::Iterator it(reinterpret_cast<scheduler::Link*>(group[2].sentinel.next));it.current;it.advance())actual.push_back(reinterpret_cast<const Animation*>(it.current->value));
++    if(count==expected_count&&actual==expected)return count;
++    std::fprintf(stderr,"layer index mismatch: layer %d group %d (%u vs %u)\n",layer,secondary?1:0,count,expected_count);
++    return select_layer_animations(group,layer,secondary);
++}
++#endif
++}
++#ifdef TH_SDL3
++void invalidate_layer_index() noexcept {++layer_version;}
++#else
++void invalidate_layer_index() noexcept {}
++#endif
+ std::uint32_t select_layer_animations(AnimationList* group,std::int32_t layer,bool secondary) noexcept {
+     initialize_animation_list(group[2]);std::uint32_t selected=0;
+     for(scheduler::Iterator it(reinterpret_cast<scheduler::Link*>(group[secondary?1:0].sentinel.next));it.current;it.advance()){
+         auto& a=*reinterpret_cast<Animation*>(it.current->value);if(a.fields_550[8])continue;
+-        auto effective=static_cast<std::int32_t>(a.base.fields_10_28[1]);
+-        if(secondary){if(effective>=29 && effective<=36)effective+=17;else effective=effective==26?45:47;}
+-        else {if(effective>=46 && effective<=53)effective-=17;else if(effective==45)effective=26;}
++        const auto effective=effective_layer(a,secondary);
+         if(effective==layer){initialize_animation_link(a.links[1],&a);scheduler::append(reinterpret_cast<scheduler::List&>(group[2]),reinterpret_cast<scheduler::Link&>(a.links[1]));++selected;}
+     }return selected;
+ }
+@@ -70,7 +131,16 @@ void draw_selected_animations(Controller& c,AnimationList* group) {
+ }
+ std::int32_t draw_animation_layer(Controller& c,std::int32_t layer) {
+     std::lock_guard lock(runtime::shared_locks().slot(9));
++#ifdef TH_SDL3
++    static const bool check=(th20n_test_flags()&2u)!=0;
++    for(bool secondary:{false,true}){
++        const auto selected=layer<0||layer>=indexed_layers?select_layer_animations(c.lists,layer,secondary)
++            :check?select_checked_animations(c.lists,layer,secondary):select_indexed_animations(c.lists,layer,secondary);
++        if(selected){configure_animation_layer(c,layer,0);draw_selected_animations(dispatch_environment::controller(),c.lists);}
++    }
++#else
+     for(bool secondary:{false,true})if(select_layer_animations(c.lists,layer,secondary)){configure_animation_layer(c,layer,0);draw_selected_animations(dispatch_environment::controller(),c.lists);}
++#endif
+ #ifdef TH_SDL3
+     web::draw_hitbox_layer(c,layer);
+ #endif
+diff --git a/ports/th20/src/sprite_renderer/named_spawn.cpp b/ports/th20/src/sprite_renderer/named_spawn.cpp
+index 3598acc..b66f15d 100644
+--- a/ports/th20/src/sprite_renderer/named_spawn.cpp
++++ b/ports/th20/src/sprite_renderer/named_spawn.cpp
+@@ -18,7 +18,7 @@ void spawn_named_animation(Controller& c,AnimationFile& file,std::uint32_t& out,
+     select_animation_template(file,animation,script);
+     animation.field_4e8=reinterpret_cast<std::uint32_t>(group);animation.base.flags[1]|=0x200;
+     if(layer>=0) {
+-        animation.base.fields_10_28[1]=static_cast<std::uint32_t>(layer);
++        invalidate_layer_index();animation.base.fields_10_28[1]=static_cast<std::uint32_t>(layer);
+         if(layer<24) animation.base.flags[2]=(animation.base.flags[2]&~0x03000000u)|0x01000000u;
+     }
+     if(!position && !(flags&8)) animation.vector_5bc={};
+diff --git a/ports/th20/src/sprite_renderer/pool.cpp b/ports/th20/src/sprite_renderer/pool.cpp
+index 33a649a..bb40572 100644
+--- a/ports/th20/src/sprite_renderer/pool.cpp
++++ b/ports/th20/src/sprite_renderer/pool.cpp
+@@ -57,7 +57,7 @@ bool is_pooled_animation(const Controller& c,const Animation* a) noexcept {
+ }
+ std::int32_t retire_animation(Controller& c,Animation& a) {
+     if(auto* callback=reinterpret_cast<AnimationCallback*>(a.fields_550[6])){callback->retire();destroy_callback(reinterpret_cast<AnimationCallback*>(a.fields_550[6]));a.fields_550[6]=0;}
+-    release_animation_geometry(a);q::unlink(link(a.links[0]));q::unlink(link(a.links[4]));
++    release_animation_geometry(a);invalidate_layer_index();q::unlink(link(a.links[0]));q::unlink(link(a.links[4]));
+     a.fields_550[2]=a.fields_550[3]=0;
+     if(!is_pooled_animation(c,&a))destroy_heap_animation(&a);
+     else {auto& pooled=c.pool[a.index];pooled.active=0;q::insert_after(link(c.free_sentinel),link(pooled.free_link));destroy_animation_contents(a);a.handle=0;}
+@@ -76,7 +76,7 @@ Animation* resolve_animation_handle(Controller& c,std::uint32_t& handle) noexcep
+     auto* a=find_animation(c,handle);if(!a)handle=0;return a;
+ }
+ std::uint32_t register_animation(Controller& c,AnimationList* group,Animation& a,bool secondary,bool front) noexcept {
+-    a.field_4e8=reinterpret_cast<std::uint32_t>(group);auto& destination=group[secondary?1:0];
++    a.field_4e8=reinterpret_cast<std::uint32_t>(group);auto& destination=group[secondary?1:0];invalidate_layer_index();
+     if(front)prepend_animation_link(destination,a.links[0]);else q::append(list(destination),link(a.links[0]));
+     return assign_animation_handle(c,a);
+ }
+diff --git a/ports/th20/src/sprite_renderer/pool_spawn.cpp b/ports/th20/src/sprite_renderer/pool_spawn.cpp
+index 7f19f39..73cd174 100644
+--- a/ports/th20/src/sprite_renderer/pool_spawn.cpp
++++ b/ports/th20/src/sprite_renderer/pool_spawn.cpp
+@@ -24,14 +24,14 @@ std::uint32_t register_spawn(Controller& controller,Animation& a,std::uint32_t o
+ std::uint32_t spawn_child_animation(Controller& c,AnimationFile& file,Animation& parent,std::int32_t script,std::uint32_t flags) {
+     std::lock_guard lock(runtime::shared_locks().slot(9));++file.fields_5c[3];
+     auto& a=*allocate_animation(c);const auto owner=parent.field_4e8;
+-    a.base.fields_10_28[1]=parent.base.fields_10_28[1];a.base.flags[1]|=0x200;
++    invalidate_layer_index();a.base.fields_10_28[1]=parent.base.fields_10_28[1];a.base.flags[1]|=0x200;
+     a.vector_5bc={};a.field_4e8=owner;a.base.flags[1]=(a.base.flags[1]&~0x40000u)|((flags&4)<<16);
+     bind_animation_script(file,a,script,&parent);const auto result=register_spawn(c,a,owner,flags);
+     scheduler::insert_after(reinterpret_cast<scheduler::Link&>(parent.links[3]),reinterpret_cast<scheduler::Link&>(a.links[2]));return result;
+ }
+ std::uint32_t spawn_detached_animation(Controller& c,AnimationFile& file,Animation& parent,std::int32_t script,std::uint32_t flags) {
+     std::lock_guard lock(runtime::shared_locks().slot(9));++file.fields_5c[3];auto& a=*allocate_animation(c);const auto owner=parent.field_4e8;
+-    select_animation_template(file,a,script);a.field_4e8=owner;a.base.fields_10_28[1]=parent.base.fields_10_28[1];a.base.flags[1]|=0x200;
++    select_animation_template(file,a,script);a.field_4e8=owner;invalidate_layer_index();a.base.fields_10_28[1]=parent.base.fields_10_28[1];a.base.flags[1]|=0x200;
+     a.base.flags[1]=(a.base.flags[1]&~0x1000000u)|(parent.base.flags[1]&0x1000000u);
+     a.base.flags[1]=(a.base.flags[1]&~0x40000u)|((flags&4)<<16);a.vector_5bc=detached_animation_position(parent);
+     a.base.vector_38=parent.base.vector_38;a.base.vector_484=parent.base.vector_2c;execute_animation(a);return register_spawn(c,a,owner,flags);
+diff --git a/ports/th20/src/text_renderer/bitmap.cpp b/ports/th20/src/text_renderer/bitmap.cpp
+index 972901f..b865291 100644
+--- a/ports/th20/src/text_renderer/bitmap.cpp
++++ b/ports/th20/src/text_renderer/bitmap.cpp
+@@ -66,20 +66,59 @@ void Bitmap::outline(std::int32_t rows,std::int32_t first_x,std::int32_t last_x,
+     std::vector<std::uint8_t> original(pixels,pixels+pitch*rows);
+     if(format!=21 && format!=26)return;
+     const float radius_squared=_mm_cvtss_f32(_mm_mul_ss(_mm_set_ss(radius),_mm_set_ss(radius)));
+-    const int bound=_mm_cvttss_si32(_mm_set_ss(radius_squared));std::pmr::vector<std::pair<int,int>> offsets;
+-    for(int x=0;x<bound;++x)for(int y=0;y<bound;++y)if(static_cast<float>(x*x+y*y)<radius_squared && (x||y))offsets.emplace_back(x,y);
++    const int bound=_mm_cvttss_si32(_mm_set_ss(radius_squared));
+     const std::uint32_t transformed=color^0xff000000u;
+     const auto packed=static_cast<std::uint16_t>(((color>>16)&0xf0)<<4|((color>>8)&0xf0)|(color&0xf0)>>4|(((color>>28)^0xf)<<12));
+-    for(int y=0;y<rows;++y)for(int x=first_x;x<last_x;++x){auto* destination=pixels+y*pitch+x*(format==21?4:2);
+-        if(format==21 && destination[3]==0)continue;
+-        bool edge=false;
+-        for(auto [dx,dy]:offsets){
+-            for(auto [nx,ny]:{std::pair{x-dx,y-dy},std::pair{x+dx,y-dy},std::pair{x-dx,y+dy},std::pair{x+dx,y+dy}}){
+-                if(nx<0||nx>=width||ny<0||ny>=rows)continue;
+-                const auto* neighbor=original.data()+ny*pitch+nx*(format==21?4:2);
+-                if(format==21?neighbor[3]!=255:(load<std::uint16_t>(neighbor)>>12)!=15){edge=true;break;}
+-            }if(edge)break;
++    // A pixel is an edge when one of the neighbours (x+-dx, y+-dy) inside the
++    // bitmap is not fully opaque, for each offset 0<=dx,dy<bound with
++    // dx*dx+dy*dy < radius^2 (compared as float), not (0,0). For one row
++    // offset those neighbours are a single run of columns -reach..reach
++    // (the pixel itself left out on its own row), so with counts of the
++    // non-opaque pixels per row each row offset is one subtraction per
++    // pixel, done a whole row at a time: the same edges as testing every
++    // neighbour, many times faster for the outlined text of a spell card.
++    if(rows<=0||width<=0||first_x>=last_x)return;
++    std::vector<int> reach(bound>0?2*bound-1:0,-1);   // index bound-1+dy
++    for(int x=0;x<bound;++x)for(int y=0;y<bound;++y)if(static_cast<float>(x*x+y*y)<radius_squared && (x||y)) {
++        if(reach[bound-1+y]<x)reach[bound-1+y]=x;
++        if(reach[bound-1-y]<x)reach[bound-1-y]=x;
++    }
++    const int bpp=format==21?4:2,stride=width+1,columns=last_x-first_x;
++    std::vector<std::uint8_t> clear(static_cast<std::size_t>(rows)*width);       // not fully opaque
++    std::vector<std::uint32_t> counts(static_cast<std::size_t>(rows)*stride,0); // row ny: counts[ny*stride+i] = clear pixels in columns [0,i)
++    for(int ny=0;ny<rows;++ny){
++        const auto* source=original.data()+ny*pitch;auto* mask=clear.data()+static_cast<std::size_t>(ny)*width;
++        auto* count=counts.data()+static_cast<std::size_t>(ny)*stride;
++        for(int nx=0;nx<width;++nx){mask[nx]=format==21?source[nx*4+3]!=255:(load<std::uint16_t>(source+nx*2)>>12)!=15;count[nx+1]=count[nx]+mask[nx];}
++    }
++    std::vector<std::uint8_t> edges(static_cast<std::size_t>(rows)*columns,0);
++    for(int index=0;index<static_cast<int>(reach.size());++index){
++        const int dy=index-(bound-1),span=reach[index];
++        if(span<0)continue;
++        for(int y=0;y<rows;++y){
++            const int ny=y+dy;if(ny<0||ny>=rows)continue;
++            const auto* count=counts.data()+static_cast<std::size_t>(ny)*stride;
++            const auto* mask=clear.data()+static_cast<std::size_t>(ny)*width;
++            auto* edge=edges.data()+static_cast<std::size_t>(y)*columns;   // edge[x-first_x]
++            const auto test=[&](int x){   // with clipping, any x
++                const int lo=x-span<0?0:x-span,hi=x+span>=width?width-1:x+span;
++                if(lo>hi)return;
++                std::uint32_t found=count[hi+1]-count[lo];
++                if(dy==0&&x>=lo&&x<=hi)found-=mask[x];
++                edge[x-first_x]|=found!=0;
++            };
++            // Columns whose run lies inside the bitmap need no clipping.
++            const int inner_first=first_x>span?first_x:span,inner_last=last_x<width-span?last_x:width-span;
++            if(inner_first>=inner_last){for(int x=first_x;x<last_x;++x)test(x);continue;}
++            for(int x=first_x;x<inner_first;++x)test(x);
++            if(dy==0)for(int x=inner_first;x<inner_last;++x)edge[x-first_x]|=(count[x+span+1]-count[x-span]-mask[x])!=0;
++            else for(int x=inner_first;x<inner_last;++x)edge[x-first_x]|=(count[x+span+1]-count[x-span])!=0;
++            for(int x=inner_last;x<last_x;++x)test(x);
+         }
++    }
++    for(int y=0;y<rows;++y)for(int x=first_x;x<last_x;++x){auto* destination=pixels+y*pitch+x*bpp;
++        if(format==21 && destination[3]==0)continue;
++        const bool edge=edges[static_cast<std::size_t>(y)*columns+(x-first_x)]!=0;
+         if(format==21){if(edge)store(destination,transformed);else store(destination,(load<std::uint32_t>(destination)&0xff000000u)|(transformed&0xffffffu));}
+         else {if(edge)store(destination,packed);else store(destination,static_cast<std::uint16_t>((load<std::uint16_t>(destination)&0xf000u)|(packed&0xfffu)));}
+     }
+diff --git a/ports/th20/web/cpp/platform/TextureLoader.cpp b/ports/th20/web/cpp/platform/TextureLoader.cpp
+index b13e098..943acc4 100644
+--- a/ports/th20/web/cpp/platform/TextureLoader.cpp
++++ b/ports/th20/web/cpp/platform/TextureLoader.cpp
+@@ -9,6 +9,7 @@
+ #define STBI_ONLY_BMP
+ #define STBI_ONLY_JPEG
+ #include "third_party/stb_image.h"
++#include "th20n_native.h"
+ 
+ namespace th20::web {
+ namespace {
+@@ -91,6 +92,15 @@ void resample_triangle(const std::uint8_t* src, int sw, int sh, int sx0, int sy0
+ }
+ 
+ bool decode_image(const std::uint8_t* bytes, std::uint32_t size, DecodedImage& out) {
++    // Native build: decoded and converted to BGRA by the host (same pixels).
++    std::uint32_t native_w = 0, native_h = 0;
++    if (th20n_image_open(bytes, size, &native_w, &native_h)) {
++        out.width = native_w;
++        out.height = native_h;
++        out.pixels.resize(std::size_t(native_w) * native_h * 4);
++        th20n_image_take_bgra(out.pixels.data());
++        return true;
++    }
+     int w = 0, h = 0, channels = 0;
+     auto* rgba = stbi_load_from_memory(bytes, int(size), &w, &h, &channels, 4);
+     if (!rgba || w <= 0 || h <= 0) return false;
+diff --git a/ports/th20/web/cpp/sdl/FileHost.cpp b/ports/th20/web/cpp/sdl/FileHost.cpp
+index a40adb4..d6b17e6 100644
+--- a/ports/th20/web/cpp/sdl/FileHost.cpp
++++ b/ports/th20/web/cpp/sdl/FileHost.cpp
+@@ -99,9 +99,12 @@ std::uint32_t open(const char* cp932_path, bool write) {
+         parents(path);
+         io = SDL_IOFromFile(path.c_str(), "wb");
+     } else if (name == "thbgm.dat") {
+-        // The canonical BGM source is the /bgm-ogg OGG set, not a retail
+-        // thbgm.dat on disk; mirror the TH07/TH08/TH10 web file hosts.
+-        io = th20_music_stream();
++        // Native port: the retail thbgm.dat in the data folder holds the same
++        // PCM byte space (thbgm.fmt offsets) that the OGG-backed stream
++        // presents, so it is read directly; the /bgm-ogg set is the fallback.
++        io = SDL_IOFromFile((root + "/" + name).c_str(), "rb");
++        if (!io) io = SDL_IOFromFile(("/game/" + name).c_str(), "rb");
++        if (!io) io = th20_music_stream();
+     } else {
+         io = SDL_IOFromFile((root + "/" + name).c_str(), "rb");
+         if (!io) io = SDL_IOFromFile(("/game/" + name).c_str(), "rb");
+diff --git a/ports/th20/web/cpp/sdl/GraphicsHost.cpp b/ports/th20/web/cpp/sdl/GraphicsHost.cpp
+index 2abd4db..8c7ac0d 100644
+--- a/ports/th20/web/cpp/sdl/GraphicsHost.cpp
++++ b/ports/th20/web/cpp/sdl/GraphicsHost.cpp
+@@ -6,6 +6,8 @@
+ #include "../platform/Graphics.hpp"
+ #include "Renderer.hpp"
+ #include "StartupBranding.hpp"
++#include "th20n_native.h"
++#include <algorithm>
+ #include <deque>
+ #include <array>
+ #include <map>
+@@ -23,13 +25,20 @@ struct Resource {
+     Surface s{};
+     std::vector<u8> bytes;
+     bool scalable=false;
++    bool game_target=false; // a render target texture of the game (not the backbuffer or its depth)
+     std::array<std::int32_t,4> lock_rect{};
+     bool locked=false;
+ };
+ struct Host {
+     std::map<u32, Resource> resources;
+     u32 next = 1, startup_credit = 0;
+-    u32 density = 1;
++    u32 density = 1;        // the backbuffer's pixel scale
++    // Native build: the game's own render targets (the playfield layers) may
++    // use a lower scale than the backbuffer (th20n_target_scale). They then
++    // need a depth buffer of their own scale; the game clears depth whenever
++    // it changes target, so no depth carries over between the two.
++    u32 target_density = 1;
++    u32 depth_low = 0;
+     std::deque<Texture> textures;       // deque: Texture* stays stable for the game
+     std::unique_ptr<Renderer> gpu;
+     u32 back = 0, depth = 0, target = 0; // target 0 means the backbuffer
+@@ -42,12 +51,12 @@ struct Host {
+         if (it == resources.end()) { std::fprintf(stderr, "SDL TH20 invalid surface %u\n", id); std::abort(); }
+         return it->second;
+     }
+-    u32 image(u32 w, u32 h, PixelFormat f, bool renderTarget=false) {
++    u32 image(u32 w, u32 h, PixelFormat f, bool renderTarget=false, bool gameTarget=false) {
+         const u32 id = next++;
+         auto& r = resources[id];
+         r.s.handle = id; r.s.width = w; r.s.height = h; r.s.format = f;
+-        r.scalable=renderTarget;
+-        r.s.pixelScale = renderTarget ? density : 1;
++        r.scalable=renderTarget;r.game_target=gameTarget;
++        r.s.pixelScale = renderTarget ? (gameTarget ? target_density : density) : 1;
+         r.s.pitch = w * pixel_bytes(f);
+         r.s.size = r.s.pitch * h;
+         // Render targets live on the GPU. Allocate a CPU copy only if a
+@@ -59,6 +68,16 @@ struct Host {
+         return id;
+     }
+     void erase(u32 id) { gpu->release(id); resources.erase(id); }
++    // The depth buffer for drawing into `target`: the backbuffer's, or one of
++    // the render-target scale when that is lower.
++    u32 depth_for(u32 target) {
++        if (target_density == density) return depth;
++        auto it = resources.find(target);
++        if (it == resources.end() || !it->second.game_target) return depth;
++        if (!depth_low) { const auto& b = get(back).s; depth_low = image(b.width, b.height, PixelFormat::Depth16, true, true); }
++        return depth_low;
++    }
++    void erase_depths() { erase(depth); if (depth_low) { erase(depth_low); depth_low = 0; } }
+     static Surface resolve(void* p, u32 id) {
+         // Shared ImGui overlay pass asks for the canonical depth handle.
+         if (id == 0xffffffff) return {id, static_cast<Host*>(p)->back_token.width, static_cast<Host*>(p)->back_token.height, PixelFormat::Depth16, 0, nullptr, 0, 0, static_cast<Host*>(p)->density};
+@@ -91,7 +110,8 @@ bool GraphicsDevice::create(u32 width, u32 height, PixelFormat back_format, u32
+         }
+     }
+     host.density=host.gpu->refresh_output_size();
+-    if (host.back) { host.erase(host.back); host.erase(host.depth); }
++    host.target_density=std::min<u32>(host.density,std::max<u32>(1,th20n_target_scale()));
++    if (host.back) { host.erase(host.back); host.erase_depths(); }
+     host.back = host.image(width, height, back_format, true);
+     host.depth = host.image(width, height, PixelFormat::Depth16, true);
+     host.back_token = {host.back, width, height, back_format, true};
+@@ -105,7 +125,7 @@ bool GraphicsDevice::reset_backbuffer(u32 width, u32 height, PixelFormat back_fo
+     if (!host.gpu) return create(width, height, back_format, interval);
+     host.gpu->flush();
+     host.erase(host.back);
+-    host.erase(host.depth);
++    host.erase_depths();
+     host.back = host.image(width, height, back_format, true);
+     host.depth = host.image(width, height, PixelFormat::Depth16, true);
+     host.back_token = {host.back, width, height, back_format, true};
+@@ -119,7 +139,7 @@ bool GraphicsDevice::ready() const { return host.gpu != nullptr; }
+ 
+ void GraphicsDevice::clear(u32 flags, u32 color, float depth, u32 stencil, const std::int32_t* rects, u32 count) {
+     host.gpu->state.target = host.current_target();
+-    host.gpu->state.depth = host.depth;
++    host.gpu->state.depth = host.depth_for(host.gpu->state.target);
+     host.gpu->clear(flags, color, depth, stencil, rects, count);
+ }
+ 
+@@ -127,10 +147,12 @@ void GraphicsDevice::present() {
+     host.gpu->flush();
+     const u32 density=host.gpu->refresh_output_size();
+     if(density!=host.density){
+-        const u32 previous=host.density;host.density=density;
++        const u32 previous=host.density,previousTarget=host.target_density;host.density=density;
++        host.target_density=std::min<u32>(density,std::max<u32>(1,th20n_target_scale()));
+         for(auto& entry:host.resources)if(entry.second.scalable){
+-            entry.second.s.pixelScale=density;
+-            host.gpu->resize_surface(entry.first,previous);
++            const u32 old=entry.second.s.pixelScale;
++            entry.second.s.pixelScale=entry.second.game_target?host.target_density:density;
++            if(entry.second.s.pixelScale!=old)host.gpu->resize_surface(entry.first,entry.second.game_target?previousTarget:previous);
+         }
+         host.gpu->resize_surface(0xffffffff,previous);
+     }
+@@ -152,14 +174,14 @@ void GraphicsDevice::set_viewport(u32 x, u32 y, u32 w, u32 h, float zmin, float
+ 
+ void GraphicsDevice::draw(Topology primitive, u32 count, const void* vertices, u32 stride) {
+     host.gpu->state.target = host.current_target();
+-    host.gpu->state.depth = host.depth;
++    host.gpu->state.depth = host.depth_for(host.gpu->state.target);
+     host.gpu->state.texture = host.bound ? host.bound->id : 0;
+     host.gpu->draw(primitive, count, vertices, stride);
+ }
+ 
+ void GraphicsDevice::draw_triangle_batch(u32 count, const void* vertices, u32 stride) {
+     host.gpu->state.target = host.current_target();
+-    host.gpu->state.depth = host.depth;
++    host.gpu->state.depth = host.depth_for(host.gpu->state.target);
+     host.gpu->state.texture = host.bound ? host.bound->id : 0;
+     host.gpu->draw_batch(count, vertices, stride);
+ }
+@@ -174,7 +196,7 @@ void GraphicsDevice::draw_corner_strip(u32 first, u32 count) {
+ }
+ 
+ Texture* GraphicsDevice::create_texture(u32 width, u32 height, PixelFormat format, bool render_target) {
+-    const u32 id = host.image(width, height, format, render_target);
++    const u32 id = host.image(width, height, format, render_target, render_target);
+     for (auto& slot : host.textures)
+         if (!slot.id) {
+             slot = {id, width, height, format, render_target};
+diff --git a/ports/th20/web/cpp/sdl/InputHost.cpp b/ports/th20/web/cpp/sdl/InputHost.cpp
+index 8d43d56..3708f45 100644
+--- a/ports/th20/web/cpp/sdl/InputHost.cpp
++++ b/ports/th20/web/cpp/sdl/InputHost.cpp
+@@ -153,18 +153,22 @@ struct SdlHost : Host {
+         if (index < 0 || index >= 4 || !pads[index] || !SDL_GamepadConnected(pads[index])) return DIERR_INPUTLOST;
+         auto* pad = pads[index];
+         std::memset(output, 0, sizeof *output);
++        // The game sets every axis to the range -1000..1000 (input_win32.cpp
++        // set_axis_range) and compares lX / lY against its deadzone around 0,
++        // so report that range: the DirectInput default 0..65535 put a pad at
++        // rest at +32768, which read as right and down held.
+         LONG* axes = &output->lX;
+         for (int n = 0; n < 6; ++n) {
+             const int value = SDL_GetGamepadAxis(pad, pad_axes[n]);
+             const double unit = value < 0 ? value / 32768. : value / 32767.;
+-            axes[n] = LONG(std::floor((unit + 1) * 32767.5 + .5));
++            axes[n] = LONG(std::lround(unit * 1000));
+         }
+         for (std::uint32_t n = 0; n < sizeof(pad_slots) / sizeof(*pad_slots); ++n)
+             if (SDL_GetGamepadButton(pad, pad_slots[n])) output->rgbButtons[n] = 0x80;
+         const int x = int(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) - int(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT));
+         const int y = int(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN)) - int(SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP));
+-        if (x) { output->lX = x > 0 ? 65535 : 0; }
+-        if (y) { output->lY = y > 0 ? 65535 : 0; }
++        if (x) { output->lX = x > 0 ? 1000 : -1000; }
++        if (y) { output->lY = y > 0 ? 1000 : -1000; }
+         output->rgdwPOV[0] = (x || y)
+             ? std::uint32_t((int(std::round(std::atan2(double(x), double(-y)) * 180 / 3.141592653589793)) + 360) % 360) * 100
+             : ~0u;

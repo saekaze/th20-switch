@@ -1,0 +1,12 @@
+# clang -> wasm32-wasi with the sysroot made by scripts/make_wasi_sysroot.sh.
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR wasm32)
+set(CMAKE_C_COMPILER clang-18)
+set(CMAKE_CXX_COMPILER clang++-18)
+set(CMAKE_C_COMPILER_TARGET wasm32-wasi)
+set(CMAKE_CXX_COMPILER_TARGET wasm32-wasi)
+set(CMAKE_SYSROOT "${WASI_SYSROOT}")
+set(CMAKE_AR llvm-ar-18 CACHE FILEPATH "")
+set(CMAKE_RANLIB llvm-ranlib-18 CACHE FILEPATH "")
+set(CMAKE_EXECUTABLE_SUFFIX ".wasm")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)

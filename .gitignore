@@ -1,0 +1,22 @@
+# upstream sources are fetched at build time, never committed
+upstream/
+third_party/
+generated/
+build-wasm/
+# build trees and products
+build/
+build-switch/
+build-asan/
+build-tsan/
+build-prof/
+*.nro
+*.nro.sha256
+*.nacp
+*.elf
+# game data must never be committed
+th20.dat
+thbgm.dat
+msgothic.ttc
+msgothic.ttf
+save/
+*.ppm

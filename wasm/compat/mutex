@@ -1,0 +1,4 @@
+// See th20_single_thread.h: libc++ keeps once_flag/call_once here.
+#pragma once
+#include_next <mutex>
+#include "th20_single_thread.h"

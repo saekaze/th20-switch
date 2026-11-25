@@ -1,0 +1,46 @@
+// <atomic> plus std::atomic_ref for the TH20 wasm32 build: libc++ 18 does not
+// have atomic_ref yet (TH20 uses it on plain struct fields). The wasm build is
+// single-threaded, so the operations act on the referenced object directly,
+// through the compiler's __atomic builtins.
+#pragma once
+#include_next <atomic>
+#if !defined(__cpp_lib_atomic_ref)
+#include <type_traits>
+namespace std {
+template<class T> class atomic_ref {
+    T* p;
+public:
+    using value_type=T;
+    static constexpr bool is_always_lock_free=true;
+    static constexpr size_t required_alignment=alignof(T);
+    explicit atomic_ref(T& v) noexcept:p(&v){}
+    atomic_ref(const atomic_ref&) noexcept=default;
+    atomic_ref& operator=(const atomic_ref&)=delete;
+    bool is_lock_free() const noexcept{return true;}
+    void store(T v,memory_order=memory_order_seq_cst) const noexcept{__atomic_store(p,&v,__ATOMIC_SEQ_CST);}
+    T load(memory_order=memory_order_seq_cst) const noexcept{T r;__atomic_load(p,&r,__ATOMIC_SEQ_CST);return r;}
+    operator T() const noexcept{return load();}
+    T operator=(T v) const noexcept{store(v);return v;}
+    T exchange(T v,memory_order=memory_order_seq_cst) const noexcept{T r;__atomic_exchange(p,&v,&r,__ATOMIC_SEQ_CST);return r;}
+    bool compare_exchange_weak(T& e,T d,memory_order=memory_order_seq_cst,memory_order=memory_order_seq_cst) const noexcept{return __atomic_compare_exchange(p,&e,&d,true,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);}
+    bool compare_exchange_strong(T& e,T d,memory_order=memory_order_seq_cst,memory_order=memory_order_seq_cst) const noexcept{return __atomic_compare_exchange(p,&e,&d,false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T fetch_add(T v,memory_order=memory_order_seq_cst) const noexcept{return __atomic_fetch_add(p,v,__ATOMIC_SEQ_CST);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T fetch_sub(T v,memory_order=memory_order_seq_cst) const noexcept{return __atomic_fetch_sub(p,v,__ATOMIC_SEQ_CST);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T fetch_and(T v,memory_order=memory_order_seq_cst) const noexcept{return __atomic_fetch_and(p,v,__ATOMIC_SEQ_CST);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T fetch_or(T v,memory_order=memory_order_seq_cst) const noexcept{return __atomic_fetch_or(p,v,__ATOMIC_SEQ_CST);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T fetch_xor(T v,memory_order=memory_order_seq_cst) const noexcept{return __atomic_fetch_xor(p,v,__ATOMIC_SEQ_CST);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator++() const noexcept{return fetch_add(1)+1;}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator--() const noexcept{return fetch_sub(1)-1;}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator++(int) const noexcept{return fetch_add(1);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator--(int) const noexcept{return fetch_sub(1);}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator+=(T v) const noexcept{return fetch_add(v)+v;}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator-=(T v) const noexcept{return fetch_sub(v)-v;}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator|=(T v) const noexcept{return fetch_or(v)|v;}
+    template<class U=T,class=enable_if_t<is_integral_v<U>>> T operator&=(T v) const noexcept{return fetch_and(v)&v;}
+    void wait(T,memory_order=memory_order_seq_cst) const noexcept{}
+    void notify_one() const noexcept{}
+    void notify_all() const noexcept{}
+};
+template<class T> atomic_ref(T&)->atomic_ref<T>;
+}
+#endif

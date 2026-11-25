@@ -1,0 +1,24 @@
+diff --git a/libcxxabi/src/cxa_exception.cpp b/libcxxabi/src/cxa_exception.cpp
+index 65e9f45..e231462 100644
+--- a/libcxxabi/src/cxa_exception.cpp
++++ b/libcxxabi/src/cxa_exception.cpp
+@@ -213,7 +213,9 @@ __cxa_exception* __cxa_init_primary_exception(void* object, std::type_info* tinf
+   exception_header->unexpectedHandler = std::get_unexpected();
+   exception_header->terminateHandler = std::get_terminate();
+   exception_header->exceptionType = tinfo;
+-  exception_header->exceptionDestructor = dest;
++  // wasm: destructors are void*(void*); the libc++ 18 headers declare this
++  // function with void(void*), so store the pointer back in its real type.
++  exception_header->exceptionDestructor = reinterpret_cast<decltype(exception_header->exceptionDestructor)>(dest);
+   setOurExceptionClass(&exception_header->unwindHeader);
+   exception_header->unwindHeader.exception_cleanup = exception_cleanup_func;
+ 
+@@ -276,7 +278,7 @@ __cxa_throw(void *thrown_object, std::type_info *tinfo, void (_LIBCXXABI_DTOR_FU
+   __cxa_eh_globals* globals = __cxa_get_globals();
+   globals->uncaughtExceptions += 1; // Not atomically, since globals are thread-local
+ 
+-  __cxa_exception* exception_header = __cxa_init_primary_exception(thrown_object, tinfo, dest);
++  __cxa_exception* exception_header = __cxa_init_primary_exception(thrown_object, tinfo, reinterpret_cast<void(_LIBCXXABI_DTOR_FUNC*)(void*)>(dest));
+   exception_header->referenceCount = 1; // This is a newly allocated exception, no need for thread safety.
+ 
+ #if __has_feature(address_sanitizer)

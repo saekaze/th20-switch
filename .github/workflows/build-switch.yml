@@ -1,0 +1,80 @@
+name: Build Switch NRO
+
+# Two stages in one job: clang 18 compiles the TH20 runtime to wasm32 and
+# wabt's wasm2c turns it into C (Ubuntu 24.04 packages), then the devkitPro
+# devkitA64 container compiles that C with the native host into touhou20.nro.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag (e.g. v1.00a-r2); empty = just build"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install wasm tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 wasi-libc libc++-18-dev-wasm32 libc++abi-18-dev-wasm32 libclang-rt-18-dev-wasm32 wabt cmake ninja-build
+          wasm2c --version
+
+      # The TH20 runtime is downloaded at the commit in UPSTREAM_COMMIT and
+      # patches/native.patch is applied on top.
+      - name: Fetch sources
+        run: ./scripts/fetch_upstream.sh
+
+      - name: TH20 runtime to wasm, wasm2c
+        run: ./scripts/build_wasm.sh
+
+      - name: Switch build (devkitA64 container)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work -e DEVKITPRO=/opt/devkitpro devkitpro/devkita64:latest bash -euo pipefail -c '
+            apt-get update -qq && apt-get install -y -qq cmake ninja-build python3 >/dev/null
+            PM=$(command -v dkp-pacman || command -v pacman)
+            # The image ships these; the package server sometimes refuses the
+            # database sync (HTTP 403), so do not require it.
+            "$PM" -S --noconfirm --needed switch-sdl2 switch-freetype switch-harfbuzz switch-libpng switch-bzip2 switch-zlib switch-mesa switch-libdrm_nouveau >/dev/null \
+              || echo "warning: Switch packages not installed/updated; using the image'"'"'s"
+            ./scripts/build_switch.sh
+            ls -lh build-switch/touhou20.nro'
+
+      # build-switch/ belongs to the container's root user: write elsewhere.
+      - name: Checksum
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp build-switch/touhou20.nro "$RUNNER_TEMP/out/"
+          cd "$RUNNER_TEMP/out"
+          sha256sum touhou20.nro | tee touhou20.nro.sha256
+
+      - name: Upload NRO
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: touhou20-switch
+          path: ${{ runner.temp }}/out/touhou20.nro
+          if-no-files-found: error
+
+      # Tags and release_tag runs also publish the NRO as a release asset.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          files: |
+            ${{ runner.temp }}/out/touhou20.nro
+            ${{ runner.temp }}/out/touhou20.nro.sha256
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
